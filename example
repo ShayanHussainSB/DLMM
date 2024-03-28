@@ -1,0 +1,194 @@
+/// this is my rust code btw 
+use {
+    crate::errors::PoolError,
+    anchor_lang::prelude::*,
+    anchor_spl::{
+        token::{Mint, Token, TokenAccount},
+        token_interface::{Mint as MintDLMM, TokenAccount as TokenAccountDLMM, TokenInterface},
+    },
+    lb_clmm::{
+        cpi::accounts::Swap as SwapDLMM,
+        errors::LBError,
+        program::LbClmm,
+        state::{
+            bin_array_bitmap_extension::BinArrayBitmapExtension, lb_pair::LbPair, oracle::Oracle,
+        },
+    },
+};
+
+#[derive(Accounts)]
+pub struct SwapDLMMMeteora<'info> {
+    #[account(
+        mut,
+        has_one = reserve_x,
+        has_one = reserve_y,
+        has_one = token_x_mint,
+        has_one = token_y_mint,
+        has_one = oracle,
+    )]
+    pub lb_pair: AccountLoader<'info, LbPair>,
+
+    #[account(
+        has_one = lb_pair,
+    )]
+    pub bin_array_bitmap_extension: Option<AccountLoader<'info, BinArrayBitmapExtension>>,
+
+    #[account(mut)]
+    pub reserve_x: Box<InterfaceAccount<'info, TokenAccountDLMM>>,
+    #[account(mut)]
+    pub reserve_y: Box<InterfaceAccount<'info, TokenAccountDLMM>>,
+
+    #[account(
+        mut,
+        constraint = user_token_in.mint != user_token_out.mint @ LBError::InvalidTokenMint,
+        constraint = user_token_in.mint == token_x_mint.key() || user_token_in.mint == token_y_mint.key() @ LBError::InvalidTokenMint,
+    )]
+    pub user_token_in: Box<InterfaceAccount<'info, TokenAccountDLMM>>,
+    #[account(
+        mut,
+        constraint = user_token_out.mint == token_x_mint.key() || user_token_out.mint == token_y_mint.key() @ LBError::InvalidTokenMint,
+    )]
+    pub user_token_out: Box<InterfaceAccount<'info, TokenAccountDLMM>>,
+
+    pub token_x_mint: Box<InterfaceAccount<'info, MintDLMM>>,
+    pub token_y_mint: Box<InterfaceAccount<'info, MintDLMM>>,
+
+    #[account(mut)]
+    pub oracle: AccountLoader<'info, Oracle>,
+
+    #[account(mut)]
+    pub host_fee_in: Option<Box<InterfaceAccount<'info, TokenAccountDLMM>>>,
+
+    /// CHECK: this is not dangerous
+    pub event_authority: AccountInfo<'info>,
+
+    pub user: Signer<'info>,
+    pub token_x_program: Interface<'info, TokenInterface>,
+    pub token_y_program: Interface<'info, TokenInterface>,
+
+    pub meteora_program: Program<'info, LbClmm>,
+}
+
+
+
+
+// this is my typescript test cases 
+const poolKey = new PublicKey("vC5B1ZegcGBasscPAjtvgwBLahrME4tvyntC9ovpCpx");
+
+it("SOL to USDC", async () => {
+    try {
+      const pool = await DLMM.create(connection, poolKey, {
+        cluster: "devnet",
+      });
+
+      const { address: userTokenIn } = await getOrCreateAssociatedTokenAccount(
+        connection,
+        testWallet,
+        pool.tokenX.publicKey,
+        wallet.publicKey
+      );
+
+      const { address: userTokenOut } = await getOrCreateAssociatedTokenAccount(
+        connection,
+        testWallet,
+        pool.tokenY.publicKey,
+        wallet.publicKey
+      );
+
+      const inAmount = new BN(1 * 10 ** SOL.decimals);
+      const binArray = await pool.getBinArrays();
+      const swapQuote = await pool.swapQuote(
+        inAmount,
+        false,
+        new BN(0),
+        binArray
+      );
+
+      const remainingAccounts: AccountMeta[] = swapQuote.binArraysPubkey.map(
+        (data) => {
+          return {
+            isSigner: false,
+            isWritable: true,
+            pubkey: data,
+          };
+        }
+      );
+
+      const swapIx = await program.methods
+        .swapDlmmMeteora({
+          amountIn: inAmount,
+          minAmountOut: swapQuote.minOutAmount,
+        })
+        .accounts({
+          hostFeeIn: null,
+          lbPair: poolKey,
+          oracle: pool.lbPair.oracle,
+          tokenXMint: pool.lbPair.tokenXMint,
+          tokenYMint: pool.lbPair.tokenYMint,
+          reserveX: pool.lbPair.reserveX,
+          reserveY: pool.lbPair.reserveY,
+
+          // user inputs
+          userTokenIn: userTokenIn,
+          userTokenOut: userTokenOut,
+          binArrayBitmapExtension:
+            pool.binArrayBitmapExtension?.publicKey || null,
+          user: wallet.publicKey,
+
+          // this is temporary cz couldn't find anything relevant to fill this argument
+          eventAuthority: new PublicKey(
+            "D1ZN9Wj1fRSUQfCjhvnu1hqDMT7hzjzBBpi12nVniYD6"
+          ),
+          tokenYProgram: TOKEN_PROGRAM_ID,
+          tokenXProgram: TOKEN_PROGRAM_ID,
+          meteoraProgram: pool.program.programId,
+        })
+        .remainingAccounts(remainingAccounts)
+        .instruction();
+
+      const transaction = new TransactionBuilder(
+        connection,
+        wallet,
+        transaction_builder_opts
+      );
+
+      if (pool.tokenX.publicKey.equals(NATIVE_MINT)) {
+        const wrapSOLIx = await wrapSOLInstruction(
+          wallet.publicKey,
+          userTokenIn,
+          BigInt(inAmount.toNumber())
+        );
+
+        // add wrap SOL instructions
+        transaction.addInstructions(
+          wrapSOLIx.map((ix) => ({
+            cleanupInstructions: [],
+            instructions: [ix],
+            signers: [],
+          }))
+        );
+      }
+
+      // main swap instruction
+      transaction.addInstruction({
+        instructions: [swapIx],
+        cleanupInstructions: [],
+        signers: [],
+      });
+
+      const { transaction: txn } = await transaction.build();
+
+      if (!isVersionedTransaction(txn)) {
+        txn.sign(testWallet);
+
+        const sig = await connection.sendRawTransaction(txn.serialize(), {
+          skipPreflight: true,
+          preflightCommitment: "processed",
+        });
+
+        console.log("Transaction Signature", sig);
+      }
+    } catch (error) {
+      console.error(error, "ERROR");
+    }
+  });
